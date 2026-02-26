@@ -1,49 +1,79 @@
-name: Sync to Feishu
-
-on:
-  push:
-    paths:
-      - 'docs/**.md'
-
-jobs:
-  notify:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Get changed files
-        id: changed-files
-        uses: tj-actions/changed-files@v42
-        with:
-          files: docs/**.md
-      
-      - name: Get Feishu token
-        id: token
-        run: |
-          response=$(curl -s -X POST \
-            -H "Content-Type: application/json" \
-            -d "{\"app_id\":\"${{ secrets.FEISHU_APP_ID }}\",\"app_secret\":\"${{ secrets.FEISHU_APP_SECRET }}\"}" \
-            https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal)
-          token=$(echo "$response" | jq -r '.tenant_access_token')
-          echo "token=$token" >> $GITHUB_OUTPUT
-          echo "Token got: ${token:0:10}..."
-      
       - name: Send to Feishu
         if: steps.changed-files.outputs.any_changed == 'true'
+        env:
+          FEISHU_TOKEN: ${{ steps.token.outputs.token }}
+          FEISHU_RECEIVE_ID: ${{ secrets.FEISHU_RECEIVE_ID }}
+          REPO_URL: https://github.com/${{ github.repository }}/blob/main
         run: |
+          # ⚠️ 重要：请根据你的 ID 类型修改下面这一行
+          # 如果是发给个人 (ou_...) 填 open_id
+          # 如果是发给群 (oc_...) 填 chat_id
+          RECEIVE_ID_TYPE="open_id" 
+          
           for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
             filename=$(basename "$file")
-            content=$(cat "$file" | head -10 | sed 's/"/\\"/g' | tr '\n' ' ')
             
-            curl -X POST \
-              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+            # 读取文件前 10 行，并进行严格的 JSON 转义
+            raw_content=$(cat "$file" | head -10)
+            safe_content=$(echo "$raw_content" | jq -Rs '.') 
+            
+            # 构建完整的卡片 JSON
+            card_payload=$(jq -n \
+              --arg title "$filename" \
+              --arg content "$safe_content" \
+              --arg url "$REPO_URL/$file" \
+              '{
+                "card": {
+                  "header": {
+                    "title": { "tag": "plain_text", "content": ("📚 " + $title) },
+                    "template": "blue"
+                  },
+                  "elements": [
+                    {
+                      "tag": "div",
+                      "text": { "tag": "lark_md", "content": $content }
+                    },
+                    {
+                      "tag": "action",
+                      "actions": [
+                        {
+                          "tag": "button",
+                          "text": { "tag": "plain_text", "content": "查看原文" },
+                          "url": $url,
+                          "type": "primary"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }')
+
+            echo "🚀 Sending update for: $filename"
+            
+            # ✅ 修复后的 curl 命令：明确拼接 URL 参数
+            response=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer $FEISHU_TOKEN" \
               -H "Content-Type: application/json" \
               -d "{
-                \"receive_id\": \"${{ secrets.FEISHU_RECEIVE_ID }}\",
+                \"receive_id\": \"$FEISHU_RECEIVE_ID\",
                 \"msg_type\": \"interactive\",
-                \"content\": \"{\\\"card\\\":{\\\"header\\\":{\\\"title\\\":{\\\"tag\\\":\\\"plain_text\\\",\\\"content\\\":\\\"📚 $filename\\\"},\\\"template\\\":\\\"blue\\\"},\\\"elements\\\":[{\\\"tag\\\":\\\"div\\\",\\\"text\\\":{\\\"tag\\\":\\\"lark_md\\\",\\\"content\\\":\\\"$content\\\"}},{\\\"tag\\\":\\\"action\\\",\\\"actions\\\":[{\\\"tag\\\":\\\"button\\\",\\\"text\\\":{\\\"tag\\\":\\\"plain_text\\\",\\\"content\\\":\\\"查看原文\\\"},\\\"url\\\":\\\"https://github.com/${{ github.repository }}/blob/main/$file\\\",\\\"type\\\":\\\"primary\\\"}]}]}}\"
+                \"content\": $card_payload
               }" \
-              https://open.feishu.cn/open-apis/im/v1/messages
+              "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=$RECEIVE_ID_TYPE")
             
-            echo "Sent: $filename"
+            # 分离响应体和状态码
+            http_code=$(echo "$response" | tail -n1)
+            body=$(echo "$response" | sed '$d')
+            
+            if [ "$http_code" == "200" ]; then
+               # 双重检查业务状态码
+               code=$(echo "$body" | jq -r '.code')
+               if [ "$code" == "0" ]; then
+                 echo "✅ Sent successfully: $filename"
+               else
+                 echo "❌ Feishu API Error: $body"
+               fi
+            else
+              echo "⚠️ HTTP Request Failed: $http_code - $body"
+            fi
           done
