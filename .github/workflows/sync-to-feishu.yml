@@ -1,0 +1,49 @@
+name: Sync to Feishu
+
+on:
+  push:
+    paths:
+      - 'docs/**.md'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v42
+        with:
+          files: docs/**.md
+      
+      - name: Get Feishu token
+        id: token
+        run: |
+          response=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"app_id\":\"${{ secrets.FEISHU_APP_ID }}\",\"app_secret\":\"${{ secrets.FEISHU_APP_SECRET }}\"}" \
+            https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal)
+          token=$(echo "$response" | jq -r '.tenant_access_token')
+          echo "token=$token" >> $GITHUB_OUTPUT
+          echo "Token got: ${token:0:10}..."
+      
+      - name: Send to Feishu
+        if: steps.changed-files.outputs.any_changed == 'true'
+        run: |
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            filename=$(basename "$file")
+            content=$(cat "$file" | head -10 | sed 's/"/\\"/g' | tr '\n' ' ')
+            
+            curl -X POST \
+              -H "Authorization: Bearer ${{ steps.token.outputs.token }}" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"receive_id\": \"${{ secrets.FEISHU_RECEIVE_ID }}\",
+                \"msg_type\": \"interactive\",
+                \"content\": \"{\\\"card\\\":{\\\"header\\\":{\\\"title\\\":{\\\"tag\\\":\\\"plain_text\\\",\\\"content\\\":\\\"📚 $filename\\\"},\\\"template\\\":\\\"blue\\\"},\\\"elements\\\":[{\\\"tag\\\":\\\"div\\\",\\\"text\\\":{\\\"tag\\\":\\\"lark_md\\\",\\\"content\\\":\\\"$content\\\"}},{\\\"tag\\\":\\\"action\\\",\\\"actions\\\":[{\\\"tag\\\":\\\"button\\\",\\\"text\\\":{\\\"tag\\\":\\\"plain_text\\\",\\\"content\\\":\\\"查看原文\\\"},\\\"url\\\":\\\"https://github.com/${{ github.repository }}/blob/main/$file\\\",\\\"type\\\":\\\"primary\\\"}]}]}}\"
+              }" \
+              https://open.feishu.cn/open-apis/im/v1/messages
+            
+            echo "Sent: $filename"
+          done
