@@ -21,93 +21,90 @@ jobs:
         id: token
         if: steps.changed-files.outputs.any_changed == 'true'
         run: |
-          RESPONSE=$(curl -s -X POST \
+          response=$(curl -s -X POST \
             -H "Content-Type: application/json" \
             -d "{\"app_id\":\"${{ secrets.FEISHU_APP_ID }}\",\"app_secret\":\"${{ secrets.FEISHU_APP_SECRET }}\"}" \
             https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal)
-          
-          CODE=$(echo $RESPONSE | jq -r '.code')
-          if [ "$CODE" != "0" ]; then
-            echo "Failed to get token: $RESPONSE"
-            exit 1
-          fi
-          
-          TOKEN=$(echo $RESPONSE | jq -r '.tenant_access_token')
-          echo "token=$TOKEN" >> $GITHUB_OUTPUT
-          echo "Token acquired."
-
+          token=$(echo "$response" | jq -r '.tenant_access_token')
+          echo "token=$token" >> $GITHUB_OUTPUT
+          echo "Token got."
+      
       - name: Send to Feishu
         if: steps.changed-files.outputs.any_changed == 'true'
         env:
           FEISHU_TOKEN: ${{ steps.token.outputs.token }}
           FEISHU_RECEIVE_ID: ${{ secrets.FEISHU_RECEIVE_ID }}
-          # ⚠️ 重要：如果是群聊，请改为 chat_id；如果是个人，保持 open_id
-          RECEIVE_ID_TYPE: "open_id" 
-          FILE_PATH: ${{ steps.changed-files.outputs.all_changed_files }}
           REPO_URL: https://github.com/${{ github.repository }}/blob/main
         run: |
-          # 获取第一个变化的文件路径
-          FIRST_FILE=$(echo "$FILE_PATH" | awk '{print $1}')
-          
-          if [ -z "$FIRST_FILE" ]; then
-            echo "No files changed."
-            exit 0
-          fi
-          
-          FILENAME=$(basename "$FIRST_FILE")
-          # 读取内容并简单转义 (替换换行符为 \n，替换双引号为 \" )
-          # 注意：这里为了稳健，只取前 500 个字符，防止内容过长导致 JSON 爆炸
-          CONTENT=$(cat "$FIRST_FILE" | head -20 | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c 1-500)
-          
-          echo "Sending notification for: $FILENAME"
-          
-          # 发送请求
-          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-            -H "Authorization: Bearer $FEISHU_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"receive_id\": \"$FEISHU_RECEIVE_ID\",
-              \"msg_type\": \"interactive\",
-              \"content\": {
-                \"card\": {
-                  \"header\": {
-                    \"title\": {
-                      \"tag\": \"plain_text\",
-                      \"content\": \"📚 $FILENAME\"
+          # 遍历所有变更文件
+          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
+            filename=$(basename "$file")
+            
+            # 简单处理内容：取前10行，换行变空格，双引号转义
+            # 这种简单处理足以应付大部分 Markdown 通知
+            content=$(cat "$file" | head -10 | tr '\n' ' ' | sed 's/"/\\"/g')
+            
+            echo "Sending: $filename"
+            
+            # 发送请求
+            # 注意：URL 末尾显式添加了 ?receive_id_type=open_id
+            response=$(curl -s -w "\n%{http_code}" -X POST \
+              -H "Authorization: Bearer $FEISHU_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"receive_id\": \"$FEISHU_RECEIVE_ID\",
+                \"msg_type\": \"interactive\",
+                \"content\": {
+                  \"card\": {
+                    \"header\": {
+                      \"title\": {
+                        \"tag\": \"plain_text\",
+                        \"content\": \"📚 $filename\"
+                      },
+                      \"template\": \"blue\"
                     },
-                    \"template\": \"blue\"
-                  },
-                  \"elements\": [
-                    {
-                      \"tag\": \"div\",
-                      \"text\": {
-                        \"tag\": \"lark_md\",
-                        \"content\": \"$CONTENT\"
-                      }
-                    },
-                    {
-                      \"tag\": \"action\",
-                      \"actions\": [
-                        {
-                          \"tag\": \"button\",
-                          \"text\": {
-                            \"tag\": \"plain_text\",
-                            \"content\": \"查看原文\"
-                          },
-                          \"url\": \"$REPO_URL/$FIRST_FILE\",
-                          \"type\": \"primary\"
+                    \"elements\": [
+                      {
+                        \"tag\": \"div\",
+                        \"text\": {
+                          \"tag\": \"lark_md\",
+                          \"content\": \"$content\"
                         }
-                      ]
-                    }
-                  ]
+                      },
+                      {
+                        \"tag\": \"action\",
+                        \"actions\": [
+                          {
+                            \"tag\": \"button\",
+                            \"text\": {
+                              \"tag\": \"plain_text\",
+                              \"content\": \"查看原文\"
+                            },
+                            \"url\": \"$REPO_URL/$file\",
+                            \"type\": \"primary\"
+                          }
+                        ]
+                      }
+                    ]
+                  }
                 }
-              }
-            }" \
-            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=$RECEIVE_ID_TYPE")
-          
-          if [ "$HTTP_CODE" == "200" ]; then
-            echo "✅ Success! Message sent."
-          else
-            echo "❌ Failed with HTTP code: $HTTP_CODE"
-            exit 1
-          fi
+              }" \
+              "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id")
+            
+            # 解析响应
+            http_code=$(echo "$response" | tail -n1)
+            body=$(echo "$response" | sed '$d')
+            
+            if [ "$http_code" == "200" ]; then
+              code=$(echo "$body" | jq -r '.code')
+              if [ "$code" == "0" ]; then
+                echo "✅ Success!"
+              else
+                echo "❌ Feishu Error: $body"
+                exit 1
+              fi
+            else
+              echo "❌ HTTP Error: $http_code - $body"
+              exit 1
+            fi
+          done
