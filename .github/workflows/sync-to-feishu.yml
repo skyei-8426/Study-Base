@@ -39,63 +39,89 @@ jobs:
           for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
             filename=$(basename "$file")
             
-            # 读取文件内容 (前 10 行)
+            # 1. 读取文件内容 (前 10 行)
             raw_content=$(cat "$file" | head -10)
             
-            # 使用 jq 安全地构建整个 JSON payload
-            # --arg 会自动处理所有特殊字符转义
-            payload=$(jq -n \
-              --arg receive_id "$FEISHU_RECEIVE_ID" \
+            # 2. 使用 jq 构建卡片内容 (Card Payload)
+            # 注意：这里构建的是卡片的 JSON 对象
+            card_json=$(jq -n \
               --arg filename "$filename" \
               --arg content "$raw_content" \
               --arg url "$REPO_URL/$file" \
               '{
-                "receive_id": $receive_id,
-                "msg_type": "interactive",
-                "content": {
-                  "card": {
-                    "header": {
-                      "title": {
-                        "tag": "plain_text",
-                        "content": ("📚 " + $filename)
-                      },
-                      "template": "blue"
+                "card": {
+                  "header": {
+                    "title": {
+                      "tag": "plain_text",
+                      "content": ("📚 " + $filename)
                     },
-                    "elements": [
-                      {
-                        "tag": "div",
-                        "text": {
-                          "tag": "lark_md",
-                          "content": $content
-                        }
-                      },
-                      {
-                        "tag": "action",
-                        "actions": [
-                          {
-                            "tag": "button",
-                            "text": {
-                              "tag": "plain_text",
-                              "content": "查看原文"
-                            },
-                            "url": $url,
-                            "type": "primary"
-                          }
-                        ]
+                    "template": "blue"
+                  },
+                  "elements": [
+                    {
+                      "tag": "div",
+                      "text": {
+                        "tag": "lark_md",
+                        "content": $content
                       }
-                    ]
-                  }
+                    },
+                    {
+                      "tag": "action",
+                      "actions": [
+                        {
+                          "tag": "button",
+                          "text": {
+                            "tag": "plain_text",
+                            "content": "查看原文"
+                          },
+                          "url": $url,
+                          "type": "primary"
+                        }
+                      ]
+                    }
+                  ]
                 }
               }')
             
-            echo "Sending: $filename"
+            # 3. 【关键步骤】将卡片 JSON 再次序列化为字符串
+            # 飞书要求 content 字段是一个 JSON 字符串，而不是 JSON 对象
+            # jq -c . 可以压缩并输出为单行字符串，jq -R . 可以将输入读取为原始字符串
+            # 这里我们需要把 card_json 这个变量变成一个合法的 JSON 字符串值
+            content_string=$(echo "$card_json" | jq -R .)
             
-            # 发送请求
-            # 注意：URL 末尾显式添加了 ?receive_id_type=open_id
+            # 4. 构建最终发送的消息体
+            # receive_id 和 msg_type 是外层字段
+            # content 字段填入刚才生成的字符串
+            final_payload=$(jq -n \
+              --arg receive_id "$FEISHU_RECEIVE_ID" \
+              --arg content_str "$content_string" \
+              '{
+                "receive_id": $receive_id,
+                "msg_type": "interactive",
+                "content": ($content_str | fromjson) 
+              }')
+              
+            # ⚠️ 修正：上面的 fromjson 可能会再次把字符串转回对象。
+            # 让我们用最笨但最稳妥的方法：直接拼接字符串，确保 content 是字符串格式
+            # 重新构建 final_payload，这次手动确保 content 是字符串
+            final_payload=$(jq -n \
+              --arg receive_id "$FEISHU_RECEIVE_ID" \
+              --argjson card_obj "$card_json" \
+              '{
+                "receive_id": $receive_id,
+                "msg_type": "interactive",
+                "content": ($card_obj | @json)
+              }')
+
+            echo "Sending: $filename"
+            # 调试：打印最终 payload 的前 200 个字符，确认 content 是字符串
+            # echo "Payload preview: $(echo "$final_payload" | head -c 200)..." 
+            
+            # 5. 发送请求
             response=$(curl -s -w "\n%{http_code}" -X POST \
               -H "Authorization: Bearer $FEISHU_TOKEN" \
               -H "Content-Type: application/json" \
-              -d "$payload" \
+              -d "$final_payload" \
               "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id")
             
             http_code=$(echo "$response" | tail -n1)
