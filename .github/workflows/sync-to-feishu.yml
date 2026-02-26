@@ -34,82 +34,99 @@ jobs:
           FEISHU_TOKEN: ${{ steps.token.outputs.token }}
           FEISHU_RECEIVE_ID: ${{ secrets.FEISHU_RECEIVE_ID }}
           REPO_URL: https://github.com/${{ github.repository }}/blob/main
+          FILES: ${{ steps.changed-files.outputs.all_changed_files }}
         run: |
-          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
-            filename=$(basename "$file")
-            
-            # 1. 准备内容：只取前 5 行，替换换行符为空格，转义双引号
-            # 这样保证内容是纯净的单行文本，不会破坏 JSON 结构
-            raw_text=$(cat "$file" | head -5 | tr '\n' ' ' | sed 's/"/\\"/g')
-            
-            # 2. 构建卡片对象 (Card Object)
-            # 此时 card_obj 是一个合法的 JSON 对象
-            card_obj=$(jq -n \
-              --arg title "$filename" \
-              --arg text "$raw_text" \
-              --arg url "$REPO_URL/$file" \
-              '{
-                "card": {
-                  "header": {
-                    "title": {"tag": "plain_text", "content": ("📚 " + $title)},
-                    "template": "blue"
-                  },
-                  "elements": [
-                    {
-                      "tag": "div",
-                      "text": {"tag": "lark_md", "content": $text}
-                    },
-                    {
-                      "tag": "action",
-                      "actions": [
-                        {
-                          "tag": "button",
-                          "text": {"tag": "plain_text", "content": "查看原文"},
-                          "url": $url,
-                          "type": "primary"
-                        }
+          # 使用 Python 脚本构建和发送消息，彻底解决转义问题
+          python3 - <<EOF
+          import os
+          import json
+          import urllib.request
+          import urllib.error
+
+          token = os.environ["FEISHU_TOKEN"]
+          receive_id = os.environ["FEISHU_RECEIVE_ID"]
+          repo_url = os.environ["REPO_URL"]
+          files = os.environ["FILES"].split()
+
+          url = "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id"
+
+          for file in files:
+              filename = os.path.basename(file)
+              
+              # 读取文件前 5 行
+              try:
+                  with open(file, 'r', encoding='utf-8') as f:
+                      content = "".join([line for line in f.readlines()[:5]])
+              except Exception as e:
+                  content = f"Error reading file: {e}"
+
+              # 构建卡片结构
+              card = {
+                  "card": {
+                      "header": {
+                          "title": {
+                              "tag": "plain_text",
+                              "content": f"📚 {filename}"
+                          },
+                          "template": "blue"
+                      },
+                      "elements": [
+                          {
+                              "tag": "div",
+                              "text": {
+                                  "tag": "lark_md",
+                                  "content": content
+                              }
+                          },
+                          {
+                              "tag": "action",
+                              "actions": [
+                                  {
+                                      "tag": "button",
+                                      "text": {
+                                          "tag": "plain_text",
+                                          "content": "查看原文"
+                                      },
+                                      "url": f"{repo_url}/{file}",
+                                      "type": "primary"
+                                  }
+                              ]
+                          }
                       ]
-                    }
-                  ]
-                }
-              }')
-            
-            # 3. 【核心修复】构建最终消息体
-            # 关键点：使用 @json 将 card_obj 强制转换为字符串，赋值给 content 字段
-            # 这样生成的 JSON 中，content 的值就是 "{\"card\":...}" 这种字符串格式
-            final_payload=$(jq -n \
-              --arg receive_id "$FEISHU_RECEIVE_ID" \
-              --argjson card "$card_obj" \
-              '{
-                "receive_id": $receive_id,
-                "msg_type": "interactive",
-                "content": ($card | @json)
-              }')
-            
-            echo "Sending: $filename"
-            
-            # 4. 发送请求
-            # URL 必须带 receive_id_type=open_id
-            response=$(curl -s -w "\n%{http_code}" -X POST \
-              -H "Authorization: Bearer $FEISHU_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "$final_payload" \
-              "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id")
-            
-            http_code=$(echo "$response" | tail -n1)
-            body=$(echo "$response" | sed '$d')
-            
-            if [ "$http_code" == "200" ]; then
-              code=$(echo "$body" | jq -r '.code')
-              if [ "$code" == "0" ]; then
-                echo "✅ Success! Message sent."
-              else
-                echo "❌ Feishu Error: $body"
-                exit 1
-              fi
-            else
-              echo "❌ HTTP Error: $http_code"
-              echo "Response: $body"
-              exit 1
-            fi
-          done
+                  }
+              }
+
+              # 构建最终 Payload
+              # 注意：content 字段必须是字符串化的 JSON
+              payload = {
+                  "receive_id": receive_id,
+                  "msg_type": "interactive",
+                  "content": json.dumps(card)  # json.dumps 自动处理所有转义
+              }
+
+              # 发送请求
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(payload).encode('utf-8'),
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json"
+                  },
+                  method="POST"
+              )
+
+              print(f"Sending: {filename}")
+              
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      result = json.loads(response.read().decode('utf-8'))
+                      if result.get("code") == 0:
+                          print("✅ Success! Message sent.")
+                      else:
+                          print(f"❌ Feishu Error: {result}")
+                          exit(1)
+              except urllib.error.HTTPError as e:
+                  print(f"❌ HTTP Error: {e.code}")
+                  print(f"Response: {e.read().decode('utf-8')}")
+                  exit(1)
+EOF
