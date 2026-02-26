@@ -27,7 +27,6 @@ jobs:
             https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal)
           token=$(echo "$response" | jq -r '.tenant_access_token')
           echo "token=$token" >> $GITHUB_OUTPUT
-          echo "Token got."
       
       - name: Send to Feishu
         if: steps.changed-files.outputs.any_changed == 'true'
@@ -39,61 +38,62 @@ jobs:
           for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
             filename=$(basename "$file")
             
-            # 1. 读取内容并清洗
-            # head -5: 只取前 5 行，防止太长
-            # tr '\n' ' ': 把换行符变成空格，彻底解决多行问题
-            # sed 's/"/\\"/g': 把双引号转义，防止破坏 JSON 结构
-            # sed "s/'/\\\\'/g": 把单引号也转义一下，以防万一
-            content=$(cat "$file" | head -5 | tr '\n' ' ' | sed 's/"/\\"/g' | sed "s/'/\\\\'/g")
+            # 1. 准备内容：只取前 5 行，替换换行符为空格，转义双引号
+            # 这样保证内容是纯净的单行文本，不会破坏 JSON 结构
+            raw_text=$(cat "$file" | head -5 | tr '\n' ' ' | sed 's/"/\\"/g')
             
-            echo "Sending notification for: $filename"
-            
-            # 2. 直接拼接 JSON 字符串
-            # 注意：这里 content 变量直接嵌入，因为它已经被清洗过，是安全的单行字符串
-            JSON_PAYLOAD="{
-              \"receive_id\": \"$FEISHU_RECEIVE_ID\",
-              \"msg_type\": \"interactive\",
-              \"content\": {
-                \"card\": {
-                  \"header\": {
-                    \"title\": {
-                      \"tag\": \"plain_text\",
-                      \"content\": \"📚 $filename\"
-                    },
-                    \"template\": \"blue\"
+            # 2. 构建卡片对象 (Card Object)
+            # 此时 card_obj 是一个合法的 JSON 对象
+            card_obj=$(jq -n \
+              --arg title "$filename" \
+              --arg text "$raw_text" \
+              --arg url "$REPO_URL/$file" \
+              '{
+                "card": {
+                  "header": {
+                    "title": {"tag": "plain_text", "content": ("📚 " + $title)},
+                    "template": "blue"
                   },
-                  \"elements\": [
+                  "elements": [
                     {
-                      \"tag\": \"div\",
-                      \"text\": {
-                        \"tag\": \"lark_md\",
-                        \"content\": \"$content\"
-                      }
+                      "tag": "div",
+                      "text": {"tag": "lark_md", "content": $text}
                     },
                     {
-                      \"tag\": \"action\",
-                      \"actions\": [
+                      "tag": "action",
+                      "actions": [
                         {
-                          \"tag\": \"button\",
-                          \"text\": {
-                            \"tag\": \"plain_text\",
-                            \"content\": \"查看原文\"
-                          },
-                          \"url\": \"$REPO_URL/$file\",
-                          \"type\": \"primary\"
+                          "tag": "button",
+                          "text": {"tag": "plain_text", "content": "查看原文"},
+                          "url": $url,
+                          "type": "primary"
                         }
                       ]
                     }
                   ]
                 }
-              }
-            }"
+              }')
             
-            # 3. 发送请求
+            # 3. 【核心修复】构建最终消息体
+            # 关键点：使用 @json 将 card_obj 强制转换为字符串，赋值给 content 字段
+            # 这样生成的 JSON 中，content 的值就是 "{\"card\":...}" 这种字符串格式
+            final_payload=$(jq -n \
+              --arg receive_id "$FEISHU_RECEIVE_ID" \
+              --argjson card "$card_obj" \
+              '{
+                "receive_id": $receive_id,
+                "msg_type": "interactive",
+                "content": ($card | @json)
+              }')
+            
+            echo "Sending: $filename"
+            
+            # 4. 发送请求
+            # URL 必须带 receive_id_type=open_id
             response=$(curl -s -w "\n%{http_code}" -X POST \
               -H "Authorization: Bearer $FEISHU_TOKEN" \
               -H "Content-Type: application/json" \
-              -d "$JSON_PAYLOAD" \
+              -d "$final_payload" \
               "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id")
             
             http_code=$(echo "$response" | tail -n1)
