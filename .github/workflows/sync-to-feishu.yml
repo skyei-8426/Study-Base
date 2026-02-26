@@ -17,43 +17,97 @@ jobs:
         with:
           files: docs/**.md
       
-      - name: Get Feishu Tenant Access Token
+      - name: Get Feishu Token
         id: token
         if: steps.changed-files.outputs.any_changed == 'true'
         run: |
-          echo "🔄 Requesting Feishu Token..."
-          response=$(curl -s -X POST \
+          RESPONSE=$(curl -s -X POST \
             -H "Content-Type: application/json" \
             -d "{\"app_id\":\"${{ secrets.FEISHU_APP_ID }}\",\"app_secret\":\"${{ secrets.FEISHU_APP_SECRET }}\"}" \
             https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal)
           
-          code=$(echo "$response" | jq -r '.code')
-          if [ "$code" != "0" ]; then
-            echo "❌ Failed to get token: $response"
+          CODE=$(echo $RESPONSE | jq -r '.code')
+          if [ "$CODE" != "0" ]; then
+            echo "Failed to get token: $RESPONSE"
             exit 1
           fi
           
-          token=$(echo "$response" | jq -r '.tenant_access_token')
-          echo "token=$token" >> $GITHUB_OUTPUT
-          echo "✅ Token acquired."
-      
+          TOKEN=$(echo $RESPONSE | jq -r '.tenant_access_token')
+          echo "token=$TOKEN" >> $GITHUB_OUTPUT
+          echo "Token acquired."
+
       - name: Send to Feishu
         if: steps.changed-files.outputs.any_changed == 'true'
         env:
           FEISHU_TOKEN: ${{ steps.token.outputs.token }}
           FEISHU_RECEIVE_ID: ${{ secrets.FEISHU_RECEIVE_ID }}
+          # ⚠️ 重要：如果是群聊，请改为 chat_id；如果是个人，保持 open_id
+          RECEIVE_ID_TYPE: "open_id" 
+          FILE_PATH: ${{ steps.changed-files.outputs.all_changed_files }}
           REPO_URL: https://github.com/${{ github.repository }}/blob/main
         run: |
-          # ⚠️ 重要：请根据你的 ID 类型修改下面这一行
-          # 如果是发给个人 (ou_...) 填 open_id
-          # 如果是发给群 (oc_...) 填 chat_id
-          RECEIVE_ID_TYPE="open_id" 
+          # 获取第一个变化的文件路径
+          FIRST_FILE=$(echo "$FILE_PATH" | awk '{print $1}')
           
-          for file in ${{ steps.changed-files.outputs.all_changed_files }}; do
-            filename=$(basename "$file")
-            
-            # 读取文件前 10 行，并进行严格的 JSON 转义
-            raw_content=$(cat "$file" | head -10)
-            safe_content=$(echo "$raw_content" | jq -Rs '.') 
-            
-            # 构建卡片 JSON
+          if [ -z "$FIRST_FILE" ]; then
+            echo "No files changed."
+            exit 0
+          fi
+          
+          FILENAME=$(basename "$FIRST_FILE")
+          # 读取内容并简单转义 (替换换行符为 \n，替换双引号为 \" )
+          # 注意：这里为了稳健，只取前 500 个字符，防止内容过长导致 JSON 爆炸
+          CONTENT=$(cat "$FIRST_FILE" | head -20 | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c 1-500)
+          
+          echo "Sending notification for: $FILENAME"
+          
+          # 发送请求
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+            -H "Authorization: Bearer $FEISHU_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"receive_id\": \"$FEISHU_RECEIVE_ID\",
+              \"msg_type\": \"interactive\",
+              \"content\": {
+                \"card\": {
+                  \"header\": {
+                    \"title\": {
+                      \"tag\": \"plain_text\",
+                      \"content\": \"📚 $FILENAME\"
+                    },
+                    \"template\": \"blue\"
+                  },
+                  \"elements\": [
+                    {
+                      \"tag\": \"div\",
+                      \"text\": {
+                        \"tag\": \"lark_md\",
+                        \"content\": \"$CONTENT\"
+                      }
+                    },
+                    {
+                      \"tag\": \"action\",
+                      \"actions\": [
+                        {
+                          \"tag\": \"button\",
+                          \"text\": {
+                            \"tag\": \"plain_text\",
+                            \"content\": \"查看原文\"
+                          },
+                          \"url\": \"$REPO_URL/$FIRST_FILE\",
+                          \"type\": \"primary\"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }" \
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=$RECEIVE_ID_TYPE")
+          
+          if [ "$HTTP_CODE" == "200" ]; then
+            echo "✅ Success! Message sent."
+          else
+            echo "❌ Failed with HTTP code: $HTTP_CODE"
+            exit 1
+          fi
